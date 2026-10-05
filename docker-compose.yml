@@ -1,0 +1,27 @@
+services:
+  server:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_NAME: distilgpt2
+      DEVICE: auto
+      MAX_BATCH_SIZE: 8
+      MAX_QUEUE_SIZE: 64
+      MAX_NEW_TOKENS: 128
+      REQUEST_TIMEOUT_S: 60
+      LOG_LEVEL: INFO
+    volumes:
+      - model-cache:/root/.cache/huggingface
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - server
+
+volumes:
+  model-cache:
