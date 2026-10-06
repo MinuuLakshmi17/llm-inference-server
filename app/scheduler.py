@@ -220,6 +220,11 @@ class Scheduler:
         REQUEST_LATENCY.observe(latency)
         REQUESTS.labels(status="success").inc()
 
+        # Reclaim paged KV blocks (no-op for the legacy cache and fake runners).
+        release = getattr(self.runner, "release_state", None)
+        if release is not None:
+            release(request.past_key_values)
+
         request.event_queue.put_nowait({
             "type": "done",
             "request_id": request.request_id,
@@ -249,6 +254,11 @@ class Scheduler:
         request.done = True
         request.finished_at = time.perf_counter()
         REQUESTS.labels(status="error").inc()
+
+        # Reclaim paged KV blocks (no-op for the legacy cache and fake runners).
+        release = getattr(self.runner, "release_state", None)
+        if release is not None:
+            release(request.past_key_values)
 
         try:
             request.event_queue.put_nowait({

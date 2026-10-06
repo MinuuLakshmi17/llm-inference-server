@@ -12,6 +12,9 @@ class Settings:
     request_timeout_s: float = float(os.getenv("REQUEST_TIMEOUT_S", "60"))
     model_dtype: str = os.getenv("MODEL_DTYPE", "float32")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
+    paged_kv: bool = os.getenv("PAGED_KV", "0") == "1"
+    kv_block_size: int = int(os.getenv("KV_BLOCK_SIZE", "16"))
+    kv_num_blocks: int = int(os.getenv("KV_NUM_BLOCKS", "512"))
 
 
 settings = Settings()

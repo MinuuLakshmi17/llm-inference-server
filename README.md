@@ -4,6 +4,7 @@ A master's-level systems project implementing an HTTP LLM inference server with:
 
 - **Continuous batching**: requests arriving at different times share token-generation forward passes.
 - **KV-cache management**: each active sequence keeps its own transformer attention cache.
+- **Paged KV cache** (optional): vLLM-style fixed-size block allocation with per-sequence block tables, reclamation, and fragmentation metrics.
 - **Prefill + decode phases**: prompt processing is separated from autoregressive generation.
 - **Bounded scheduler**: max batch size, queue depth, request timeout, and generation limits.
 - **Prometheus metrics**: request latency, time-to-first-token, tokens/sec, queue time, batch size, and KV-cache occupancy.
@@ -89,6 +90,34 @@ request_id
 
 The cache belongs to the sequence, not to the HTTP connection.
 
+### Paged KV cache
+
+Set `PAGED_KV=1` to replace per-sequence contiguous caches with vLLM-style
+block management (`app/paged.py`):
+
+```text
+physical pool: [block 0][block 1][block 2]...[block N]   (fixed size, e.g. 16 tokens)
+sequence A block table: [7, 23]        -> tokens 0..31 live in blocks 7, 23
+sequence B block table: [3]            -> tokens 0..15 live in block 3
+```
+
+- The `BlockAllocator` owns every physical block and reclaims them when a
+  sequence finishes (including on prefill failure).
+- Each sequence keeps a block table plus a logical token count; new blocks
+  are allocated only when the current one is full, so sequences of different
+  lengths no longer waste a full contiguous reservation each.
+- New metrics: `inference_kv_blocks_total`, `inference_kv_blocks_used`,
+  and `inference_kv_block_fragmentation_ratio` (share of allocated block
+  capacity holding no token).
+
+Honest scope note: this is the paged *management* layer. Before each forward
+pass a sequence's blocks are gathered into one contiguous tensor for the HF
+model call, and the new token's K/V is scattered back afterwards. A custom
+block-sparse attention kernel would remove the gather step; the allocation,
+reclamation, and fragmentation behavior implemented here is identical either
+way. Equivalence with the legacy path is verified token-for-token
+(`tests/test_paged.py`, plus a model-level check).
+
 ---
 
 ## Project structure
@@ -101,6 +130,7 @@ llm-inference-server/
 │   ├── main.py
 │   ├── metrics.py
 │   ├── models.py
+│   ├── paged.py
 │   ├── scheduler.py
 │   └── server.py
 ├── scripts/
@@ -108,6 +138,7 @@ llm-inference-server/
 │   └── smoke_test.py
 ├── tests/
 │   ├── test_scheduler.py
+│   ├── test_paged.py
 │   └── test_api.py
 ├── Dockerfile
 ├── docker-compose.yml
@@ -258,6 +289,9 @@ Environment variables:
 | `REQUEST_TIMEOUT_S` | `60` | Request timeout |
 | `MODEL_DTYPE` | `float32` | `float32`, `float16`, or `bfloat16` |
 | `LOG_LEVEL` | `INFO` | Logging level |
+| `PAGED_KV` | `0` | `1` enables the paged KV-cache block manager |
+| `KV_BLOCK_SIZE` | `16` | Tokens per physical KV block (paged mode) |
+| `KV_NUM_BLOCKS` | `512` | Physical KV blocks in the pool (paged mode) |
 
 For a CPU-only laptop:
 
@@ -399,7 +433,7 @@ This is intentionally not a production replacement for vLLM/TensorRT-LLM.
 
 It does not implement:
 
-- paged attention
+- block-sparse attention kernels (the paged *management* layer is implemented; the gather step before each forward pass is the remaining piece)
 - CUDA kernels
 - tensor parallelism
 - speculative decoding
@@ -416,17 +450,12 @@ Those are natural master's/PhD-level extensions.
 
 If you want to push this beyond the baseline:
 
-### 1. Paged KV cache
+### 1. Block-sparse attention kernel
 
-Replace per-request tensors with fixed-size blocks.
-
-Measure:
-
-```text
-memory fragmentation
-cache utilization
-maximum concurrent sequences
-```
+The paged block manager (`app/paged.py`) is implemented. The remaining step
+is a custom kernel that reads K/V directly from scattered blocks, removing
+the gather before each forward pass. Measure memory-bandwidth savings and
+max-batch scaling with and without the kernel.
 
 ### 2. Admission control
 

@@ -50,3 +50,18 @@ KV_SEQUENCES = Gauge(
     "inference_kv_cache_sequences",
     "Number of sequences currently holding KV cache.",
 )
+
+KV_BLOCKS_TOTAL = Gauge(
+    "inference_kv_blocks_total",
+    "Total physical KV blocks in the pool (paged mode).",
+)
+
+KV_BLOCKS_USED = Gauge(
+    "inference_kv_blocks_used",
+    "Physical KV blocks currently allocated (paged mode).",
+)
+
+KV_BLOCK_FRAGMENTATION = Gauge(
+    "inference_kv_block_fragmentation_ratio",
+    "Share of allocated block capacity holding no token (paged mode).",
+)
