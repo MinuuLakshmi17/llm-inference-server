@@ -13,5 +13,8 @@ run:
 benchmark:
 	python scripts/benchmark.py --url http://localhost:8000 --requests 32 --concurrency 8
 
+benchmark-quant:
+	python scripts/bench_quant.py --max-new-tokens 24
+
 smoke:
 	python scripts/smoke_test.py --url http://localhost:8000

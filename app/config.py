@@ -15,6 +15,8 @@ class Settings:
     paged_kv: bool = os.getenv("PAGED_KV", "0") == "1"
     kv_block_size: int = int(os.getenv("KV_BLOCK_SIZE", "16"))
     kv_num_blocks: int = int(os.getenv("KV_NUM_BLOCKS", "512"))
+    # Weight-only INT8 quantization: "none" | "int8" (per-channel) | "int8-per-tensor".
+    quantize: str = os.getenv("QUANTIZE", "none")
 
 
 settings = Settings()

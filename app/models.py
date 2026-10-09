@@ -10,8 +10,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from .config import Settings
 from .metrics import KV_BLOCK_FRAGMENTATION, KV_BLOCKS_TOTAL, KV_BLOCKS_USED
 from .paged import BlockAllocator, PagedSequence, gather_sequence, store_prefill
+from .quant import QuantStats, model_weight_bytes, quantize_model_
 
 logger = logging.getLogger(__name__)
+
+
+# Fixed probe text for activation-outlier detection at quantization time.
+_OUTLIER_PROBE_TEXT = (
+    "The harbor woke before the town did. Gulls argued over the first catch "
+    "while the fishing boats rocked gently against the wooden pilings. "
+    "Mara had walked this pier every morning for eleven years. "
+    "The tide charts said the water would be low by nine. "
+) * 3
 
 
 @dataclass
@@ -38,6 +48,38 @@ class ModelRunner:
         self.model = AutoModelForCausalLM.from_pretrained(settings.model_name, **kwargs)
         self.model.to(self.device)
         self.model.eval()
+        param_dtype = next(self.model.parameters()).dtype
+
+        # Weight-only INT8 quantization (optional): linear projection weights
+        # become int8 (+ per-channel scales) executed via integer GEMM, with
+        # an fp32 side path for activation outlier channels (LLM.int8()
+        # decomposition). The tied token embedding is quantized per-row and
+        # shared with the output head. Biases, layer norms and the KV cache
+        # stay in float.
+        self.quant_stats: QuantStats | None = None
+        if settings.quantize != "none":
+            if settings.quantize not in ("int8", "int8-per-tensor"):
+                raise ValueError(f"Unsupported QUANTIZE={settings.quantize!r}")
+            before_bytes = model_weight_bytes(self.model)
+            # Probe the tied output head for activation outlier channels on
+            # the untouched fp32 model.
+            probe_ids = torch.tensor(
+                [self.encode(_OUTLIER_PROBE_TEXT)[:128]], device=self.device
+            )
+            self.quant_stats = quantize_model_(
+                self.model,
+                per_channel=(settings.quantize == "int8"),
+                outlier_probe_ids=probe_ids,
+            )
+            after_bytes = model_weight_bytes(self.model)
+            logger.info(
+                "INT8 quantization (%s): %d linear layers, %.1f MiB -> %.1f MiB (%.2fx)",
+                settings.quantize,
+                self.quant_stats.num_linear_layers,
+                before_bytes / 2**20,
+                after_bytes / 2**20,
+                before_bytes / after_bytes,
+            )
 
         # Paged KV cache (optional): sequences keep a block table instead of
         # one contiguous cache. See app/paged.py.
@@ -47,7 +89,6 @@ class ModelRunner:
             num_layers = getattr(config, "n_layer", getattr(config, "num_hidden_layers", None))
             num_heads = getattr(config, "n_head", getattr(config, "num_attention_heads", None))
             head_dim = getattr(config, "n_embd", getattr(config, "hidden_size", None)) // num_heads
-            param_dtype = next(self.model.parameters()).dtype
             self.allocator = BlockAllocator(
                 num_blocks=settings.kv_num_blocks,
                 block_size=settings.kv_block_size,

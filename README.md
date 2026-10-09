@@ -5,6 +5,7 @@ A master's-level systems project implementing an HTTP LLM inference server with:
 - **Continuous batching**: requests arriving at different times share token-generation forward passes.
 - **KV-cache management**: each active sequence keeps its own transformer attention cache.
 - **Paged KV cache** (optional): vLLM-style fixed-size block allocation with per-sequence block tables, reclamation, and fragmentation metrics.
+- **INT8 weight quantization** (optional): from-scratch symmetric quantization with integer GEMM, per-channel scales, and LLM.int8()-style outlier handling.
 - **Prefill + decode phases**: prompt processing is separated from autoregressive generation.
 - **Bounded scheduler**: max batch size, queue depth, request timeout, and generation limits.
 - **Prometheus metrics**: request latency, time-to-first-token, tokens/sec, queue time, batch size, and KV-cache occupancy.
@@ -118,6 +119,42 @@ reclamation, and fragmentation behavior implemented here is identical either
 way. Equivalence with the legacy path is verified token-for-token
 (`tests/test_paged.py`, plus a model-level check).
 
+### INT8 weight quantization
+
+Set `QUANTIZE=int8` to quantize the model after loading (`app/quant.py`):
+
+- **Weights**: symmetric INT8, one scale per output channel. Every `nn.Linear`
+  and HF `Conv1D` projection is replaced by an `Int8Linear` holding int8
+  weights plus fp32 scales.
+- **Compute**: activations are quantized per token at runtime and the matmul
+  runs as integer GEMM (`torch._int_mm`, int8 x int8 accumulated in int32),
+  descaled once afterwards. No dequantize-then-matmul: the integer path is
+  the real thing, not quantization theater.
+- **Tied embedding/head**: GPT-2 ties `lm_head` to the token embedding. The
+  shared `[vocab, dim]` tensor is quantized once (per row); the embedding
+  becomes an `Int8Embedding` (int8 gather + descale) and the head reuses the
+  transposed int8 data. Nothing is forked or double-counted.
+- **Activation outliers**: the final hidden state carries persistent outlier
+  channels (3 of 768 channels reach magnitudes 40-150 while the median sits
+  at 0.6) that a per-token activation scale would crush. Following
+  LLM.int8(), those channels are detected with a short fixed probe at
+  quantization time and computed in fp32 alongside the int8 GEMM.
+
+Measured with `scripts/bench_quant.py` on distilgpt2 (CPU, greedy decode,
+fixed prompts and evaluation passage; 2-vCPU AMD EPYC cloud VM):
+
+| config | model size | perplexity | ms/token | greedy token-match vs fp32 |
+|---|---|---|---|---|
+| fp32 | 318.5 MiB | 89.66 | ~45 | 100% |
+| int8 (per-channel) | 126.4 MiB | 90.88 (+1.4%) | ~16 | 53% |
+| int8-per-tensor | 126.3 MiB | 105.39 (+17.5%) | ~19 | 32% |
+
+The per-tensor row is the honest ablation: one scale per matrix cannot
+represent layers with outlier channels, so perplexity degrades 17.5% --
+which is exactly why the default is per-channel. Biases, layer norms and
+the KV cache stay in float; fused INT8 kernels (which would widen the
+latency win further) are out of scope.
+
 ---
 
 ## Project structure
@@ -131,14 +168,17 @@ llm-inference-server/
 │   ├── metrics.py
 │   ├── models.py
 │   ├── paged.py
+│   ├── quant.py
 │   ├── scheduler.py
 │   └── server.py
 ├── scripts/
 │   ├── benchmark.py
+│   ├── bench_quant.py
 │   └── smoke_test.py
 ├── tests/
 │   ├── test_scheduler.py
 │   ├── test_paged.py
+│   ├── test_quant.py
 │   └── test_api.py
 ├── Dockerfile
 ├── docker-compose.yml
@@ -292,6 +332,7 @@ Environment variables:
 | `PAGED_KV` | `0` | `1` enables the paged KV-cache block manager |
 | `KV_BLOCK_SIZE` | `16` | Tokens per physical KV block (paged mode) |
 | `KV_NUM_BLOCKS` | `512` | Physical KV blocks in the pool (paged mode) |
+| `QUANTIZE` | `none` | `int8` (per-channel) or `int8-per-tensor` weight quantization |
 
 For a CPU-only laptop:
 
@@ -438,7 +479,9 @@ It does not implement:
 - tensor parallelism
 - speculative decoding
 - distributed serving
-- quantization kernels
+- fused INT8 kernels (the integer GEMM path is implemented; a fused kernel
+  would remove the per-forward activation-quantization overhead)
+- FP8 / microscaling formats
 - prefix caching
 - GPU memory compaction
 
